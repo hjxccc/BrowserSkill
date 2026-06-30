@@ -1,5 +1,16 @@
 # BrowserSkill
 
+> **Fork note.** This is a fork of [Tencent/BrowserSkill](https://github.com/Tencent/BrowserSkill) (MIT).
+> It adds **console & network capture** on top of upstream: the extension buffers CDP
+> `Runtime` / `Log` / `Network` events per tab, so an agent can read console messages
+> (including engine-level errors like failed-resource 404s and uncaught exceptions with
+> stack) and network responses with real status codes — things the `evaluate` workaround
+> can't get. In this branch it's surfaced through the existing `evaluate` command via two
+> tokens (`__bsk_console__` / `__bsk_network__`); a proper `bsk console` / `bsk network`
+> command would be the clean form. Proposed upstream in
+> [Tencent/BrowserSkill#2](https://github.com/Tencent/BrowserSkill/issues/2).
+> All credit for the original project goes to the upstream authors.
+
 <p align="center">
   <img src="docs/assets/browserskill-readme-banner.png" alt="BrowserSkill banner" />
 </p>

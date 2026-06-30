@@ -130,6 +130,30 @@ function extractValue(remote: CdpRemoteObject | undefined): unknown {
   return null;
 }
 
+/**
+ * bsk 二开: intercept magic-token expressions so the existing `bsk
+ * evaluate` command can read the CDP console / network buffers without
+ * a dedicated CLI subcommand. Returns `undefined` for ordinary
+ * expressions so they fall through to `Runtime.evaluate`.
+ *
+ *   bsk evaluate --session X "__bsk_console__"   -> ConsoleEntry[]
+ *   bsk evaluate --session X "__bsk_network__"   -> NetworkEntry[]
+ */
+function readObservabilityMagic(
+  expression: string,
+  cdp: CdpRunner,
+  tabId: number,
+): unknown[] | undefined {
+  switch (expression.trim()) {
+    case "__bsk_console__":
+      return cdp.consoleEntries?.(tabId) ?? [];
+    case "__bsk_network__":
+      return cdp.networkEntries?.(tabId) ?? [];
+    default:
+      return undefined;
+  }
+}
+
 export async function handleEvaluate(
   manager: SessionManager,
   params: EvaluateParams,
@@ -149,6 +173,12 @@ export async function handleEvaluate(
   if (denied) return denied;
   if (abortedError(deps.signal)) {
     return { code: "cancelled", message: "evaluate aborted" };
+  }
+  // bsk 二开: magic tokens surface the CDP console / network buffers
+  // captured by ChromiumCdp, without needing a new bsk CLI subcommand.
+  const observed = readObservabilityMagic(params.expression, deps.cdp, target.tabId);
+  if (observed !== undefined) {
+    return { ok: true, tab_id: target.tabId, value: observed };
   }
   const dialogCursor = markDialogCursor(deps.cdp, target.tabId);
   deps.cdp.trackSessionTab?.(ctx.sessionId, target.tabId);

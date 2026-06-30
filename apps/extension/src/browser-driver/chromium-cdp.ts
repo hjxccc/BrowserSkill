@@ -78,6 +78,34 @@ export type DialogCursor = number;
 const MAX_DIALOG_BUFFER = 32;
 const MAX_DIALOG_FIELD_LENGTH = 4096;
 
+// --- Console / network observability (bsk 二开: console & network capture) ---
+const MAX_CONSOLE_BUFFER = 200;
+const MAX_NETWORK_BUFFER = 200;
+const MAX_OBS_FIELD_LENGTH = 4096;
+
+/** A captured console / log / uncaught-exception line. */
+export interface ConsoleEntry {
+  kind: "console" | "exception" | "log";
+  level: string;
+  text: string;
+  url?: string;
+  line?: number;
+  timestamp?: number;
+}
+
+/** A captured network response / failure. */
+export interface NetworkEntry {
+  method?: string;
+  url: string;
+  status?: number;
+  statusText?: string;
+  mimeType?: string;
+  resourceType?: string;
+  failed?: boolean;
+  errorText?: string;
+  timestamp?: number;
+}
+
 interface ParsedDialogOpening {
   type: JavaScriptDialogType;
   message: string;
@@ -97,13 +125,18 @@ export class ChromiumCdp {
   private readonly tabOwners = new Map<number, Set<string>>();
   private readonly dialogBuffers = new Map<number, JavaScriptDialogInfo[]>();
   private readonly dialogSequences = new Map<number, number>();
+  private readonly consoleBuffers = new Map<number, ConsoleEntry[]>();
+  private readonly networkBuffers = new Map<number, NetworkEntry[]>();
+  private readonly netRequestMeta = new Map<string, { url: string; method?: string }>();
   private detachSubscription: { dispose(): void } | null = null;
   private dialogSubscription: { dispose(): void } | null = null;
+  private obsSubscription: { dispose(): void } | null = null;
 
   constructor(api: CdpDebuggerApi = chromeDebuggerApi) {
     this.api = api;
     this.bindAutoDetach();
     this.bindDialogHandler();
+    this.bindObservabilityHandler();
   }
 
   /** Attach to `tabId` if we haven't already in this driver. */
@@ -117,6 +150,7 @@ export class ChromiumCdp {
     const attach = (async () => {
       await this.api.attach({ tabId }, CDP_PROTOCOL_VERSION);
       await this.enablePageDomain(tabId);
+      await this.enableObservabilityDomains(tabId);
       this.attachedTabs.add(tabId);
     })()
       .catch((err) => {
@@ -159,12 +193,23 @@ export class ChromiumCdp {
     return buf.filter((entry) => entry.sequence > cursor);
   }
 
+  /** Console / log / exception lines buffered for `tabId` since attach. */
+  consoleEntries(tabId: number): ConsoleEntry[] {
+    return [...(this.consoleBuffers.get(tabId) ?? [])];
+  }
+
+  /** Network responses / failures buffered for `tabId` since attach. */
+  networkEntries(tabId: number): NetworkEntry[] {
+    return [...(this.networkBuffers.get(tabId) ?? [])];
+  }
+
   /** Detach if attached; never throws. */
   async detach(tabId: number): Promise<void> {
     this.attachInFlight.delete(tabId);
     if (!this.attachedTabs.has(tabId)) return;
     this.attachedTabs.delete(tabId);
     this.clearDialogState(tabId);
+    this.clearObservability(tabId);
     try {
       await this.api.detach({ tabId });
     } catch (err) {
@@ -204,6 +249,9 @@ export class ChromiumCdp {
     this.attachedTabs.clear();
     this.dialogBuffers.clear();
     this.dialogSequences.clear();
+    this.consoleBuffers.clear();
+    this.networkBuffers.clear();
+    this.netRequestMeta.clear();
     await Promise.all(
       tabs.map(async (tabId) => {
         try {
@@ -217,6 +265,74 @@ export class ChromiumCdp {
 
   private async enablePageDomain(tabId: number): Promise<void> {
     await this.api.sendCommand({ tabId }, "Page.enable", {});
+  }
+
+  /**
+   * Enable the CDP domains needed for console / network capture. Each is
+   * best-effort: a restricted page that rejects `Network.enable` must not
+   * break attach or the existing Page/dialog flow.
+   */
+  private async enableObservabilityDomains(tabId: number): Promise<void> {
+    for (const method of ["Runtime.enable", "Log.enable", "Network.enable"]) {
+      try {
+        await this.api.sendCommand({ tabId }, method, {});
+      } catch (err) {
+        console.debug("[bsk cdp] observability enable failed", { tabId, method, err });
+      }
+    }
+  }
+
+  private bindObservabilityHandler(): void {
+    if (this.obsSubscription) return;
+    const listener = (source: chrome.debugger.Debuggee, method: string, params: unknown) => {
+      const tabId = source.tabId;
+      if (typeof tabId !== "number") return;
+      switch (method) {
+        case "Runtime.consoleAPICalled":
+          this.appendConsole(tabId, parseConsoleApi(params));
+          break;
+        case "Runtime.exceptionThrown":
+          this.appendConsole(tabId, parseException(params));
+          break;
+        case "Log.entryAdded":
+          this.appendConsole(tabId, parseLogEntry(params));
+          break;
+        case "Network.requestWillBeSent":
+          rememberRequest(this.netRequestMeta, params);
+          break;
+        case "Network.responseReceived":
+          this.appendNetwork(tabId, parseResponse(this.netRequestMeta, params));
+          break;
+        case "Network.loadingFailed":
+          this.appendNetwork(tabId, parseLoadingFailed(this.netRequestMeta, params));
+          break;
+      }
+    };
+    this.api.onEvent.addListener(listener);
+    this.obsSubscription = {
+      dispose: () => this.api.onEvent.removeListener(listener),
+    };
+  }
+
+  private appendConsole(tabId: number, entry: ConsoleEntry | null): void {
+    if (!entry) return;
+    const buf = this.consoleBuffers.get(tabId) ?? [];
+    buf.push(entry);
+    while (buf.length > MAX_CONSOLE_BUFFER) buf.shift();
+    this.consoleBuffers.set(tabId, buf);
+  }
+
+  private appendNetwork(tabId: number, entry: NetworkEntry | null): void {
+    if (!entry) return;
+    const buf = this.networkBuffers.get(tabId) ?? [];
+    buf.push(entry);
+    while (buf.length > MAX_NETWORK_BUFFER) buf.shift();
+    this.networkBuffers.set(tabId, buf);
+  }
+
+  private clearObservability(tabId: number): void {
+    this.consoleBuffers.delete(tabId);
+    this.networkBuffers.delete(tabId);
   }
 
   private bindDialogHandler(): void {
@@ -280,6 +396,7 @@ export class ChromiumCdp {
         this.attachInFlight.delete(source.tabId);
         this.tabOwners.delete(source.tabId);
         this.clearDialogState(source.tabId);
+        this.clearObservability(source.tabId);
       }
     };
     this.api.onDetach.addListener(listener);
@@ -294,6 +411,8 @@ export class ChromiumCdp {
     this.detachSubscription = null;
     this.dialogSubscription?.dispose();
     this.dialogSubscription = null;
+    this.obsSubscription?.dispose();
+    this.obsSubscription = null;
   }
 
   /** Detach tabs only when no other live session has claimed them. */
@@ -346,4 +465,126 @@ function normalizeError(err: unknown): Error {
     return new Error(String((err as { message: unknown }).message));
   }
   return new Error("unknown chrome.debugger error");
+}
+
+// --- Console / network event parsers (best-effort, defensive casts) ---------
+
+function obsField(value: unknown): string {
+  const s = typeof value === "string" ? value : String(value ?? "");
+  return s.length <= MAX_OBS_FIELD_LENGTH ? s : `${s.slice(0, MAX_OBS_FIELD_LENGTH)}... [truncated]`;
+}
+
+function remoteArgToText(arg: unknown): string {
+  const a = (arg ?? {}) as Record<string, unknown>;
+  if ("value" in a && a.value !== undefined) return String(a.value);
+  if (typeof a.description === "string") return a.description;
+  if (typeof a.unserializableValue === "string") return a.unserializableValue;
+  if (typeof a.type === "string") return `[${a.type}]`;
+  return "";
+}
+
+/** `Runtime.consoleAPICalled` → ConsoleEntry. */
+function parseConsoleApi(params: unknown): ConsoleEntry | null {
+  const p = (params ?? {}) as Record<string, unknown>;
+  const args = Array.isArray(p.args) ? p.args : [];
+  const text = obsField(args.map(remoteArgToText).filter(Boolean).join(" "));
+  const stack = (p.stackTrace ?? {}) as Record<string, unknown>;
+  const frames = Array.isArray(stack.callFrames) ? (stack.callFrames as Record<string, unknown>[]) : [];
+  const top = frames[0];
+  return {
+    kind: "console",
+    level: typeof p.type === "string" ? p.type : "log",
+    text,
+    url: top && typeof top.url === "string" ? obsField(top.url) : undefined,
+    line: top && typeof top.lineNumber === "number" ? top.lineNumber + 1 : undefined,
+    timestamp: typeof p.timestamp === "number" ? p.timestamp : undefined,
+  };
+}
+
+/** `Runtime.exceptionThrown` → ConsoleEntry (level=error). */
+function parseException(params: unknown): ConsoleEntry | null {
+  const p = (params ?? {}) as Record<string, unknown>;
+  const details = (p.exceptionDetails ?? {}) as Record<string, unknown>;
+  const exception = (details.exception ?? {}) as Record<string, unknown>;
+  const text =
+    (typeof exception.description === "string" && exception.description) ||
+    (typeof details.text === "string" && details.text) ||
+    "Uncaught (unknown error)";
+  return {
+    kind: "exception",
+    level: "error",
+    text: obsField(text),
+    url: typeof details.url === "string" ? obsField(details.url) : undefined,
+    line: typeof details.lineNumber === "number" ? details.lineNumber + 1 : undefined,
+    timestamp: typeof p.timestamp === "number" ? p.timestamp : undefined,
+  };
+}
+
+/** `Log.entryAdded` → ConsoleEntry (engine-level: network errors, CSP, …). */
+function parseLogEntry(params: unknown): ConsoleEntry | null {
+  const p = (params ?? {}) as Record<string, unknown>;
+  const entry = (p.entry ?? {}) as Record<string, unknown>;
+  return {
+    kind: "log",
+    level: typeof entry.level === "string" ? entry.level : "info",
+    text: obsField(typeof entry.text === "string" ? entry.text : ""),
+    url: typeof entry.url === "string" ? obsField(entry.url) : undefined,
+    line: typeof entry.lineNumber === "number" ? entry.lineNumber : undefined,
+    timestamp: typeof entry.timestamp === "number" ? entry.timestamp : undefined,
+  };
+}
+
+function rememberRequest(
+  meta: Map<string, { url: string; method?: string }>,
+  params: unknown,
+): void {
+  const p = (params ?? {}) as Record<string, unknown>;
+  const id = typeof p.requestId === "string" ? p.requestId : undefined;
+  const req = (p.request ?? {}) as Record<string, unknown>;
+  if (!id || typeof req.url !== "string") return;
+  meta.set(id, { url: req.url, method: typeof req.method === "string" ? req.method : undefined });
+  if (meta.size > 1024) {
+    // bound the correlation map — drop oldest insertion
+    const first = meta.keys().next().value;
+    if (first !== undefined) meta.delete(first);
+  }
+}
+
+/** `Network.responseReceived` → NetworkEntry. */
+function parseResponse(
+  meta: Map<string, { url: string; method?: string }>,
+  params: unknown,
+): NetworkEntry | null {
+  const p = (params ?? {}) as Record<string, unknown>;
+  const id = typeof p.requestId === "string" ? p.requestId : undefined;
+  const resp = (p.response ?? {}) as Record<string, unknown>;
+  const url = typeof resp.url === "string" ? resp.url : (id ? meta.get(id)?.url : undefined);
+  if (!url) return null;
+  return {
+    method: id ? meta.get(id)?.method : undefined,
+    url: obsField(url),
+    status: typeof resp.status === "number" ? resp.status : undefined,
+    statusText: typeof resp.statusText === "string" ? obsField(resp.statusText) : undefined,
+    mimeType: typeof resp.mimeType === "string" ? resp.mimeType : undefined,
+    resourceType: typeof p.type === "string" ? p.type : undefined,
+    timestamp: typeof p.timestamp === "number" ? p.timestamp : undefined,
+  };
+}
+
+/** `Network.loadingFailed` → NetworkEntry (failed=true). */
+function parseLoadingFailed(
+  meta: Map<string, { url: string; method?: string }>,
+  params: unknown,
+): NetworkEntry | null {
+  const p = (params ?? {}) as Record<string, unknown>;
+  const id = typeof p.requestId === "string" ? p.requestId : undefined;
+  const info = id ? meta.get(id) : undefined;
+  return {
+    method: info?.method,
+    url: obsField(info?.url ?? "(unknown)"),
+    failed: true,
+    errorText: typeof p.errorText === "string" ? obsField(p.errorText) : undefined,
+    resourceType: typeof p.type === "string" ? p.type : undefined,
+    timestamp: typeof p.timestamp === "number" ? p.timestamp : undefined,
+  };
 }

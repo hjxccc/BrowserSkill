@@ -46,6 +46,8 @@ export interface CdpRunner {
   };
   dialogCursor?(tabId: number): DialogCursor;
   dialogsSince?(tabId: number, cursor: DialogCursor): JavaScriptDialogInfo[];
+  consoleEntries?(tabId: number): unknown[];
+  networkEntries?(tabId: number): unknown[];
 }
 
 /**
